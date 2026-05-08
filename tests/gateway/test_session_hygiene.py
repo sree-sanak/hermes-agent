@@ -150,25 +150,18 @@ class TestSessionHygieneThresholds:
         needs_compress = approx_tokens >= compress_token_threshold
         assert not needs_compress
 
-    def test_threshold_scales_with_model(self):
-        """Different models should have different compression thresholds."""
-        # 128k model at 85% = 108,800 tokens
-        small_model_threshold = int(128_000 * 0.85)
-        # 200k model at 85% = 170,000 tokens
-        large_model_threshold = int(200_000 * 0.85)
-        # 1M model at 85% = 850,000 tokens
-        huge_model_threshold = int(1_000_000 * 0.85)
+    def test_absolute_cap_triggers_for_huge_window_models(self):
+        """A 100k+ session should compress even if the model context is larger.
 
-        # A session at ~120k tokens:
-        history = _make_large_history_tokens(120_000)
+        Large-window models make 100k tokens technically valid, but Discord
+        sessions at that size are slow and expensive. Gateway hygiene therefore
+        has a separate absolute cap.
+        """
+        absolute_cap = 100_000
+        history = _make_large_history_tokens(101_000)
         approx_tokens = estimate_messages_tokens_rough(history)
 
-        # Should trigger for 128k model
-        assert approx_tokens >= small_model_threshold
-        # Should NOT trigger for 200k model
-        assert approx_tokens < large_model_threshold
-        # Should NOT trigger for 1M model
-        assert approx_tokens < huge_model_threshold
+        assert approx_tokens >= absolute_cap
 
     def test_custom_threshold_percentage(self):
         """Custom threshold percentage from config should be respected."""

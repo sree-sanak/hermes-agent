@@ -71,6 +71,7 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+        self.remove_user = AsyncMock()
 
 
 @pytest.fixture
@@ -281,6 +282,61 @@ async def test_no_thread_with_auto_thread_disabled_is_noop(adapter, monkeypatch)
     adapter.handle_message.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_auto_thread_remove_author_after_response(adapter, monkeypatch):
+    """When enabled, the triggering author is removed after Hermes replies."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_REMOVE_AUTHOR", "true")
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=900), content="hello")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    fake_thread.remove_user.assert_awaited_once_with(message.author)
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_does_not_remove_author_by_default(adapter, monkeypatch):
+    """Author removal is opt-in so existing Discord behavior is preserved."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD_REMOVE_AUTHOR", raising=False)
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=900), content="hello")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    fake_thread.remove_user.assert_not_awaited()
+
+
+def test_auto_thread_archive_duration_uses_config(adapter, monkeypatch):
+    """Auto-created threads use the configured Discord archive duration."""
+    monkeypatch.delenv("DISCORD_AUTO_THREAD_ARCHIVE_DURATION", raising=False)
+    adapter.config.extra["auto_thread_archive_duration"] = 10080
+
+    assert adapter._discord_auto_thread_archive_duration() == 10080
+
+
+def test_auto_thread_archive_duration_validates_allowed_values(adapter, monkeypatch):
+    """Invalid archive durations fall back to Discord's 7-day max."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_ARCHIVE_DURATION", "123")
+
+    assert adapter._discord_auto_thread_archive_duration() == 10080
+
+
 # ── config.py bridging ───────────────────────────────────────────────
 
 
@@ -322,6 +378,44 @@ def test_config_bridges_no_thread_channels(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_NO_THREAD_CHANNELS") == "333"
+
+
+def test_config_bridges_auto_thread_archive_duration(monkeypatch, tmp_path):
+    """gateway/config.py bridges discord.auto_thread_archive_duration to env var."""
+    import yaml
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "discord": {
+            "auto_thread_archive_duration": 10080,
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_ARCHIVE_DURATION", "")
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_DURATION") == "10080"
+
+
+def test_config_bridges_auto_thread_remove_author(monkeypatch, tmp_path):
+    """gateway/config.py bridges discord.auto_thread_remove_author to env var."""
+    import yaml
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "discord": {
+            "auto_thread_remove_author": True,
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_REMOVE_AUTHOR", "")
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("DISCORD_AUTO_THREAD_REMOVE_AUTHOR") == "true"
 
 
 def test_config_env_var_takes_precedence(monkeypatch, tmp_path):
