@@ -1010,14 +1010,17 @@ class APIServerAdapter(BasePlatformAdapter):
         dashboard can display full status without needing a shared PID file or
         /proc access.  No authentication required.
         """
-        from gateway.status import read_runtime_status
+        from gateway.status import read_runtime_status, summarize_runtime_health
 
         runtime = read_runtime_status() or {}
+        health = summarize_runtime_health(runtime)
         return web.json_response({
-            "status": "ok",
+            "status": health["status"],
             "platform": "hermes-agent",
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
+            "delivery_targets": runtime.get("delivery_targets", {}),
+            "health_issues": health["issues"],
             "active_agents": runtime.get("active_agents", 0),
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),

@@ -43,6 +43,9 @@ def _ensure_discord_mock():
                 self.callback = callback
                 self.parent = parent
 
+        class _FakeCommandNotFound(Exception):
+            pass
+
         discord_mod.app_commands = SimpleNamespace(
             describe=lambda **kwargs: (lambda fn: fn),
             choices=lambda **kwargs: (lambda fn: fn),
@@ -50,6 +53,7 @@ def _ensure_discord_mock():
             Choice=lambda **kwargs: SimpleNamespace(**kwargs),
             Group=_FakeGroup,
             Command=_FakeCommand,
+            errors=SimpleNamespace(CommandNotFound=_FakeCommandNotFound),
         )
 
         ext_mod = MagicMock()
@@ -71,11 +75,49 @@ def _ensure_discord_mock():
             _app.autocomplete = lambda **kwargs: (lambda fn: fn)
         except Exception:
             pass
+    if _app is not None and not hasattr(_app, "errors"):
+        class _FakeCommandNotFound(Exception):
+            pass
+
+        try:
+            _app.errors = SimpleNamespace(CommandNotFound=_FakeCommandNotFound)
+        except Exception:
+            pass
 
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _discord_app_command_name,
+    _is_voice_bridge_command_not_found,
+)
+
+
+def _command_not_found(name="voice-handoff"):
+    command_not_found_cls = sys.modules["discord"].app_commands.errors.CommandNotFound
+    try:
+        return command_not_found_cls(name, [])
+    except TypeError:
+        return command_not_found_cls(name)
+
+
+def test_discord_app_command_name_reads_raw_interaction_data():
+    interaction = SimpleNamespace(data={"name": "voice-handoff"})
+
+    assert _discord_app_command_name(interaction) == "voice-handoff"
+
+
+def test_voice_bridge_command_not_found_is_ignored_from_raw_interaction_data():
+    interaction = SimpleNamespace(data={"name": "voice-handoff"})
+
+    assert _is_voice_bridge_command_not_found(interaction, _command_not_found()) is True
+
+
+def test_non_voice_bridge_command_not_found_is_not_ignored():
+    interaction = SimpleNamespace(command_name="restart")
+
+    assert _is_voice_bridge_command_not_found(interaction, _command_not_found("restart")) is False
 
 
 class FakeTree:
@@ -509,7 +551,7 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     message.create_thread.assert_awaited_once()
     call_kwargs = message.create_thread.await_args[1]
     assert call_kwargs["name"] == "Hello world, how are you?"
-    assert call_kwargs["auto_archive_duration"] == 1440
+    assert call_kwargs["auto_archive_duration"] == 10080
 
 
 @pytest.mark.asyncio
@@ -589,7 +631,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
-        auto_archive_duration=1440,
+        auto_archive_duration=10080,
         reason="Auto-threaded from mention by Jezza",
     )
 

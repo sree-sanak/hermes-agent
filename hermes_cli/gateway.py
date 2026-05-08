@@ -3837,11 +3837,17 @@ def _runtime_health_lines() -> list[str]:
     active_agents = state.get("active_agents")
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
+    delivery_targets = state.get("delivery_targets", {}) or {}
 
     for platform, pdata in platforms.items():
         if pdata.get("state") == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
+
+    for target, tdata in delivery_targets.items():
+        if isinstance(tdata, dict) and tdata.get("state") == "stale":
+            message = tdata.get("error_message") or tdata.get("error_code") or "delivery target unavailable"
+            lines.append(f"⚠ delivery target stale: {target}: {message}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")

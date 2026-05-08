@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -7,6 +9,7 @@ from typing import Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
+from hermes_constants import get_hermes_home
 from hermes_cli.auth import _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -124,11 +127,64 @@ def _resolve_codex_usage_url(base_url: str) -> str:
     return normalized + "/api/codex/usage"
 
 
+def _jwt_account_id(token: str) -> Optional[str]:
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return None
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return (
+            (payload.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+            or payload.get("chatgpt_account_id")
+            or None
+        )
+    except Exception:
+        return None
+
+
+def _read_codex_pool_credentials() -> Optional[dict[str, str]]:
+    """Return openai-codex credentials from auth.json credential_pool.
+
+    Some installations store Codex OAuth only in the shared credential pool,
+    not in the legacy Codex token location used by resolve_codex_runtime_credentials().
+    Account usage should still work in that setup.
+    """
+    try:
+        path = get_hermes_home() / "auth.json"
+        auth = json.loads(path.read_text())
+        entries = (auth.get("credential_pool") or {}).get("openai-codex") or []
+        for entry in entries:
+            token = str(entry.get("access_token") or "").strip()
+            if not token:
+                continue
+            return {
+                "api_key": token,
+                "base_url": str(entry.get("base_url") or "https://chatgpt.com/backend-api/codex"),
+                "account_id": str(entry.get("account_id") or "").strip() or _jwt_account_id(token) or "",
+            }
+    except Exception:
+        return None
+    return None
+
+
 def _fetch_codex_account_usage() -> Optional[AccountUsageSnapshot]:
-    creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
-    token_data = _read_codex_tokens()
+    try:
+        creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+    except Exception:
+        creds = _read_codex_pool_credentials()
+    if not creds:
+        return None
+    try:
+        token_data = _read_codex_tokens()
+    except Exception:
+        token_data = {}
     tokens = token_data.get("tokens") or {}
-    account_id = str(tokens.get("account_id", "") or "").strip() or None
+    account_id = (
+        str(tokens.get("account_id", "") or "").strip()
+        or str(creds.get("account_id", "") or "").strip()
+        or None
+    )
     headers = {
         "Authorization": f"Bearer {creds['api_key']}",
         "Accept": "application/json",

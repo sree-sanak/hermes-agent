@@ -158,6 +158,51 @@ SILENT_MARKER = "[SILENT]"
 _hermes_home: Path | None = None
 
 
+_DISCORD_UNKNOWN_CHANNEL_MARKERS = (
+    "Unknown Channel",
+    "error code: 10003",
+    "ChannelNotFound",
+)
+
+
+def _is_stale_discord_target_error(error: object) -> bool:
+    """Return True when a Discord delivery error means the target is stale."""
+    text = str(error or "")
+    return any(marker in text for marker in _DISCORD_UNKNOWN_CHANNEL_MARKERS)
+
+
+def _record_delivery_target_result(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    error: object | None,
+    *,
+    job_id: str | None = None,
+) -> None:
+    """Update runtime health for stale delivery targets.
+
+    Only Discord Unknown Channel is currently classified as stale. Successful
+    Discord sends clear a previous stale marker for the same channel/thread.
+    """
+    if platform_name.lower() != "discord":
+        return
+    try:
+        from gateway.status import clear_stale_delivery_target, mark_stale_delivery_target
+        if error and _is_stale_discord_target_error(error):
+            mark_stale_delivery_target(
+                "discord",
+                str(chat_id),
+                thread_id=str(thread_id) if thread_id else None,
+                error_code="unknown_channel",
+                error_message=str(error),
+                job_id=job_id,
+            )
+        elif not error:
+            clear_stale_delivery_target("discord", str(chat_id), thread_id=str(thread_id) if thread_id else None)
+    except Exception:
+        logger.debug("Failed to update Discord delivery target runtime health", exc_info=True)
+
+
 def _get_hermes_home() -> Path:
     """Resolve Hermes home dynamically while preserving test monkeypatch hooks."""
     return _hermes_home or get_hermes_home()
@@ -737,6 +782,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             raise
                         if send_result and not getattr(send_result, "success", True):
                             err = getattr(send_result, "error", "unknown")
+                            _record_delivery_target_result(platform_name, chat_id, thread_id, err, job_id=job.get("id"))
                             logger.warning(
                                 "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                                 job["id"], platform_name, chat_id, err,
@@ -769,9 +815,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
                 if adapter_ok:
+                    _record_delivery_target_result(platform_name, chat_id, thread_id, None, job_id=job.get("id"))
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
+                _record_delivery_target_result(platform_name, chat_id, thread_id, e, job_id=job.get("id"))
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
                     job["id"], platform_name, chat_id, e,
@@ -792,17 +840,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                     result = future.result(timeout=30)
             except Exception as e:
+                _record_delivery_target_result(platform_name, chat_id, thread_id, e, job_id=job.get("id"))
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
 
             if result and result.get("error"):
+                _record_delivery_target_result(platform_name, chat_id, thread_id, result["error"], job_id=job.get("id"))
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
 
+            _record_delivery_target_result(platform_name, chat_id, thread_id, None, job_id=job.get("id"))
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
     if delivery_errors:
@@ -1450,6 +1501,19 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # os.environ["TERMINAL_CWD"] here is safe for those jobs. For workdir-less
     # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
+    # TERMINAL_CWD is process-global.  A crashed/aborted prior cron run can
+    # leave it pointing at a deleted temp workdir, which then breaks even
+    # workdir-less jobs before their commands can run.  Sanitize that stale
+    # state at the start of every cron job.
+    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    if _prior_terminal_cwd != "_UNSET_" and not Path(_prior_terminal_cwd).is_dir():
+        logger.warning(
+            "Job '%s': clearing stale TERMINAL_CWD %r because it no longer exists",
+            job_id, _prior_terminal_cwd,
+        )
+        os.environ.pop("TERMINAL_CWD", None)
+        _prior_terminal_cwd = "_UNSET_"
+
     _job_workdir = (job.get("workdir") or "").strip() or None
     if _job_workdir and not Path(_job_workdir).is_dir():
         # Directory was removed between create-time validation and now.  Log
@@ -1459,7 +1523,6 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             job_id, _job_workdir,
         )
         _job_workdir = None
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
     if _job_workdir:
         os.environ["TERMINAL_CWD"] = _job_workdir
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)

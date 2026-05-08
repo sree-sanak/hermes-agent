@@ -3719,6 +3719,9 @@ class BasePlatformAdapter(ABC):
                 _image_paths: list = []
                 _non_image_media: list = []
                 for media_path, is_voice in media_files:
+                    if not Path(media_path).is_file():
+                        logger.info("[%s] Skipping missing MEDIA attachment: %s", self.name, media_path)
+                        continue
                     _ext = Path(media_path).suffix.lower()
                     if (_ext in _IMAGE_EXTS
                             and not is_voice

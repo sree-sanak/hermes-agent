@@ -6,6 +6,8 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
 import copy
+import gzip
+import hashlib
 import json
 import logging
 import shutil
@@ -1092,31 +1094,108 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
-    ensure_dirs()
-    job_output_dir = _job_output_dir(job_id)
-    job_output_dir.mkdir(parents=True, exist_ok=True)
-    _secure_dir(job_output_dir)
-    
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
-    
-    fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
+_OUTPUT_COMPACT_THRESHOLD_BYTES = 32 * 1024
+_OUTPUT_PROMPT_PREVIEW_CHARS = 1500
+_OUTPUT_RESPONSE_PREVIEW_CHARS = 7000
+
+
+def _write_atomic_text(path: Path, content: str) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(output)
+            f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, output_file)
-        _secure_file(output_file)
+        atomic_replace(tmp_path, path)
+        _secure_file(path)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
-    
+
+
+def _write_atomic_gzip(path: Path, content: str) -> None:
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp', prefix='.output_', text=False)
+    try:
+        with os.fdopen(fd, 'wb') as raw:
+            with gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=6, mtime=0) as gz:
+                gz.write(content.encode('utf-8'))
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(tmp_path, path)
+        _secure_file(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _extract_cron_output_sections(output: str) -> tuple[str, str]:
+    marker = "\n## Response\n"
+    if marker not in output:
+        return output, ""
+    before, response = output.split(marker, 1)
+    return before.rstrip(), response.strip()
+
+
+def _compact_job_output(output: str, full_artifact_name: str) -> str:
+    """Return a small markdown artifact while preserving the full run in gzip."""
+    before_response, response = _extract_cron_output_sections(output)
+    digest = hashlib.sha256(output.encode('utf-8')).hexdigest()
+    prompt_preview = before_response
+    if len(prompt_preview) > _OUTPUT_PROMPT_PREVIEW_CHARS:
+        prompt_preview = prompt_preview[:_OUTPUT_PROMPT_PREVIEW_CHARS].rstrip() + "\n\n[... prompt/full metadata truncated in compact artifact ...]"
+
+    response_preview = response
+    if len(response_preview) > _OUTPUT_RESPONSE_PREVIEW_CHARS:
+        response_preview = response_preview[:_OUTPUT_RESPONSE_PREVIEW_CHARS].rstrip() + "\n\n[... response truncated in compact artifact ...]"
+
+    return (
+        f"{prompt_preview}\n\n"
+        "## Artifact Compaction\n\n"
+        f"Full artifact: `{full_artifact_name}`\n"
+        f"Original bytes: {len(output.encode('utf-8'))}\n"
+        f"SHA-256: `{digest}`\n\n"
+        "## Response\n\n"
+        f"{response_preview}\n"
+    )
+
+
+def save_job_output(job_id: str, output: str):
+    """Save job output to file.
+
+    Large cron artifacts are saved as a compact .md plus a gzip-compressed
+    full copy. This keeps context_from and dashboards fast while preserving
+    full auditability on disk. Set HERMES_CRON_OUTPUT_FULL_MD=1 to force the
+    legacy single full .md artifact.
+    """
+    ensure_dirs()
+    job_output_dir = _job_output_dir(job_id)
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(job_output_dir)
+
+    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_file = job_output_dir / f"{timestamp}.md"
+
+    force_full_md = os.getenv("HERMES_CRON_OUTPUT_FULL_MD", "").strip().lower() in {"1", "true", "yes"}
+    output_bytes = len(output.encode('utf-8'))
+    try:
+        threshold = int(os.getenv("HERMES_CRON_OUTPUT_COMPACT_THRESHOLD_BYTES", _OUTPUT_COMPACT_THRESHOLD_BYTES))
+    except (TypeError, ValueError):
+        threshold = _OUTPUT_COMPACT_THRESHOLD_BYTES
+
+    if not force_full_md and output_bytes > threshold:
+        full_file = job_output_dir / f"{timestamp}.full.md.gz"
+        _write_atomic_gzip(full_file, output)
+        compact = _compact_job_output(output, full_file.name)
+        _write_atomic_text(output_file, compact)
+    else:
+        _write_atomic_text(output_file, output)
+
     return output_file
 
 

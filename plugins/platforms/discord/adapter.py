@@ -30,6 +30,7 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_VOICE_BRIDGE_APP_COMMANDS = {"voice-handoff", "voice-defaults"}
 
 try:
     import discord
@@ -83,6 +84,39 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+def _discord_app_command_name(interaction: Any) -> Optional[str]:
+    """Best-effort slash command name extraction for unresolved interactions."""
+    command_name = getattr(interaction, "command_name", None)
+    if command_name:
+        return command_name
+    command = getattr(interaction, "command", None)
+    command_name = getattr(command, "name", None)
+    if command_name:
+        return command_name
+    data = getattr(interaction, "data", None)
+    if isinstance(data, dict):
+        command_name = data.get("name")
+        if isinstance(command_name, str) and command_name:
+            return command_name
+    return None
+
+
+def _is_voice_bridge_command_not_found(interaction: Any, error: BaseException) -> bool:
+    """Return True for sidecar Discord voice app commands unknown to Hermes.
+
+    discord.py raises CommandNotFound before resolving ``interaction.command``;
+    depending on version/mock shape the command name may live on
+    ``interaction.command_name`` or raw ``interaction.data['name']``.
+    """
+    if discord is None:
+        return False
+    app_errors = getattr(getattr(discord, "app_commands", None), "errors", None)
+    command_not_found_cls = getattr(app_errors, "CommandNotFound", None)
+    if command_not_found_cls is None or not isinstance(error, command_not_found_cls):
+        return False
+    return _discord_app_command_name(interaction) in _VOICE_BRIDGE_APP_COMMANDS
 
 
 def check_discord_requirements() -> bool:
@@ -812,6 +846,33 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
 
                 await self._handle_message(message)
+
+            @self._client.tree.error
+            async def on_app_command_error(interaction, error):
+                """Avoid noisy tracebacks for app commands owned by sidecar bots.
+
+                Sree's Discord voice bridge runs as a separate Node process but can
+                share the same Discord application token as the main Hermes gateway.
+                Discord may deliver those interactions to both websocket clients;
+                the bridge handles them, while discord.py reports CommandNotFound.
+                Treat the known voice bridge commands as foreign-owned and stay
+                quiet instead of logging alarming stack traces.
+                """
+                command_name = _discord_app_command_name(interaction)
+                if _is_voice_bridge_command_not_found(interaction, error):
+                    logger.info(
+                        "[%s] Ignoring Discord app command %r handled by the voice bridge",
+                        adapter_self.name,
+                        command_name,
+                    )
+                    return
+                logger.error(
+                    "[%s] Discord app command %r failed: %s",
+                    adapter_self.name,
+                    command_name,
+                    error,
+                    exc_info=True,
+                )
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -3640,6 +3701,21 @@ class DiscordAdapter(BasePlatformAdapter):
             and getattr(att, "waveform", None) is not None
         )
 
+    def _discord_auto_thread_archive_duration(self) -> int:
+        """Return Discord auto-created thread archive duration in minutes."""
+        configured = self.config.extra.get("auto_thread_archive_duration")
+        raw = configured if configured is not None else os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_DURATION", "10080")
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            logger.warning("[%s] Invalid Discord auto_thread_archive_duration=%r; using 10080", self.name, raw)
+            return 10080
+        if value not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+            allowed = ", ".join(str(v) for v in VALID_THREAD_AUTO_ARCHIVE_MINUTES)
+            logger.warning("[%s] Invalid Discord auto_thread_archive_duration=%r; expected one of %s; using 10080", self.name, raw, allowed)
+            return 10080
+        return value
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
 
@@ -3810,6 +3886,54 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
             return ""
 
+    def _discord_auto_thread_remove_author(self) -> bool:
+        """Return whether auto-created threads should remove the author after the reply.
+
+        This keeps Discord's active thread list from filling up for users who
+        mention Hermes in a parent channel and only want the answer, not a long
+        lived thread subscription.
+        """
+        configured = self.config.extra.get("auto_thread_remove_author")
+        raw = configured if configured is not None else os.getenv("DISCORD_AUTO_THREAD_REMOVE_AUTHOR", "false")
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw)
+
+    async def _remove_auto_thread_author(self, thread: Any, author: Any) -> None:
+        """Best-effort remove the triggering author from an auto-created thread."""
+        if not thread or not author:
+            return
+        remove_user = getattr(thread, "remove_user", None)
+        if not callable(remove_user):
+            logger.debug("[%s] Auto-thread author removal unavailable on thread object", self.name)
+            return
+        try:
+            await remove_user(author)
+            logger.info(
+                "[%s] Removed author %s from auto-created Discord thread %s",
+                self.name,
+                getattr(author, "id", "?"),
+                getattr(thread, "id", "?"),
+            )
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to remove author %s from auto-created Discord thread %s: %s",
+                self.name,
+                getattr(author, "id", "?"),
+                getattr(thread, "id", "?"),
+                e,
+            )
+
+    async def _handle_message_with_auto_thread_cleanup(self, event: MessageEvent) -> None:
+        """Dispatch an event, then run any auto-thread cleanup attached to it."""
+        try:
+            await self.handle_message(event)
+        finally:
+            cleanup = getattr(event, "_discord_auto_thread_cleanup", None)
+            if cleanup:
+                thread, author = cleanup
+                await self._remove_auto_thread_author(thread, author)
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -3926,7 +4050,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
 
         try:
-            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+            thread = await message.create_thread(name=thread_name, auto_archive_duration=self._discord_auto_thread_archive_duration())
             return thread
         except Exception as direct_error:
             display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
@@ -3935,7 +4059,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 seed_msg = await message.channel.send(f"\U0001f9f5 Thread created by Hermes: **{thread_name}**")
                 thread = await seed_msg.create_thread(
                     name=thread_name,
-                    auto_archive_duration=1440,
+                    auto_archive_duration=self._discord_auto_thread_archive_duration(),
                     reason=reason,
                 )
                 return thread
@@ -4619,6 +4743,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # For threads whose parent is a forum channel, inherit the parent's topic
         # so forum descriptions (e.g. project instructions) appear in the session context.
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
+        guild = getattr(message, "guild", None)
 
         # Build source
         guild = getattr(message, "guild", None)
@@ -4827,6 +4952,9 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_context=_channel_context,
         )
 
+        if auto_threaded_channel and self._discord_auto_thread_remove_author():
+            event._discord_auto_thread_cleanup = (auto_threaded_channel, message.author)  # type: ignore[attr-defined]
+
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
@@ -4837,7 +4965,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(event)
         else:
-            await self.handle_message(event)
+            await self._handle_message_with_auto_thread_cleanup(event)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Discord client-side splits)
@@ -4910,7 +5038,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # into handle_message → the agent's streaming request,
             # aborting the response the user was waiting on.  The new
             # chunk is handled by the fresh flush task regardless.
-            await asyncio.shield(self.handle_message(event))
+            await asyncio.shield(self._handle_message_with_auto_thread_cleanup(event))
         except asyncio.CancelledError:
             # Only reached if cancel landed before the pop — the shielded
             # handle_message is unaffected either way.  Let the task exit

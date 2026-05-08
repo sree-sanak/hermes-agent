@@ -533,9 +533,29 @@ class TestHealthDetailedEndpoint:
                 assert data["platform"] == "hermes-agent"
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
+                assert data["health_issues"] == []
                 assert data["active_agents"] == 2
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_reports_degraded_subsystems(self, adapter):
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value={
+            "gateway_state": "running",
+            "platforms": {"voice": {"state": "fatal", "error_code": "voice_disconnected", "error_message": "voice bridge lost"}},
+            "delivery_targets": {"discord:123:456": {"state": "stale", "error_code": "unknown_channel"}},
+            "active_agents": 0,
+            "exit_reason": None,
+            "updated_at": "2026-04-14T00:00:00Z",
+        }):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "degraded"
+                assert data["platforms"]["voice"]["state"] == "fatal"
+                assert len(data["health_issues"]) == 2
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):

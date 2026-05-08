@@ -8,6 +8,31 @@ from types import SimpleNamespace
 from gateway import status
 
 
+class TestDeliveryTargetRuntimeStatus:
+    def test_mark_and_clear_stale_delivery_target(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.mark_stale_delivery_target(
+            "discord",
+            "123",
+            thread_id="456",
+            error_message="Unknown Channel",
+            job_id="job1",
+        )
+
+        payload = status.read_runtime_status()
+        target = payload["delivery_targets"]["discord:123:456"]
+        assert target["state"] == "stale"
+        assert target["error_code"] == "unknown_channel"
+        assert target["error_message"] == "Unknown Channel"
+        assert target["job_id"] == "job1"
+
+        status.clear_stale_delivery_target("discord", "123", thread_id="456")
+
+        payload = status.read_runtime_status()
+        assert "discord:123:456" not in payload.get("delivery_targets", {})
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

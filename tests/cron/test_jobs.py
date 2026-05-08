@@ -994,3 +994,22 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+    def test_large_output_is_compacted_with_full_gzip(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_OUTPUT_COMPACT_THRESHOLD_BYTES", "128")
+        prompt = "# Cron Job: Big\n\n## Prompt\n\n" + ("prompt line\n" * 800)
+        response = "Important final response\n" + ("response line\n" * 20)
+        output = f"{prompt}\n## Response\n\n{response}"
+
+        output_file = save_job_output("test123", output)
+
+        compact = output_file.read_text()
+        assert "## Artifact Compaction" in compact
+        assert "Important final response" in compact
+        assert "prompt line" in compact
+        assert len(compact) < len(output)
+
+        full_files = list(output_file.parent.glob("*.full.md.gz"))
+        assert len(full_files) == 1
+        import gzip
+        assert gzip.decompress(full_files[0].read_bytes()).decode("utf-8") == output

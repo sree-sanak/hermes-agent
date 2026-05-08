@@ -546,9 +546,111 @@ def write_runtime_status(
     _write_json_file(path, payload)
 
 
+def mark_stale_delivery_target(
+    platform: str,
+    chat_id: str,
+    *,
+    thread_id: str | None = None,
+    error_code: str = "unknown_channel",
+    error_message: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    """Record an inaccessible delivery target in gateway runtime health.
+
+    This is intentionally non-destructive: cron jobs are not paused here. The
+    stale marker makes `/gateway status`, dashboards, and health checks surface
+    the problem instead of burying it in gateway logs.
+    """
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path) or _build_runtime_status_record()
+    payload.setdefault("delivery_targets", {})
+    key = f"{platform}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+    payload["delivery_targets"][key] = {
+        "state": "stale",
+        "platform": platform,
+        "chat_id": str(chat_id),
+        "thread_id": str(thread_id) if thread_id is not None else None,
+        "error_code": error_code,
+        "error_message": error_message or error_code,
+        "job_id": job_id,
+        "updated_at": _utc_now_iso(),
+    }
+    payload.setdefault("kind", _GATEWAY_KIND)
+    payload["updated_at"] = _utc_now_iso()
+    _write_json_file(path, payload)
+
+
+def clear_stale_delivery_target(platform: str, chat_id: str, *, thread_id: str | None = None) -> None:
+    """Clear a stale delivery marker after a target sends successfully."""
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path)
+    if not payload:
+        return
+    targets = payload.get("delivery_targets")
+    if not isinstance(targets, dict):
+        return
+    key = f"{platform}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+    if key in targets:
+        targets.pop(key, None)
+        payload["updated_at"] = _utc_now_iso()
+        _write_json_file(path, payload)
+
+
 def read_runtime_status() -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information."""
     return _read_json_file(_get_runtime_status_path())
+
+
+def summarize_runtime_health(runtime: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize gateway runtime state for health endpoints.
+
+    `running` means the gateway process is alive. `ok` means all known
+    subsystems are healthy. A fatal/disconnected/retrying/degraded platform or
+    stale delivery target makes the overall status `degraded` instead of
+    hiding behind process liveness.
+    """
+    runtime = runtime or {}
+    issues: list[dict[str, Any]] = []
+
+    gateway_state = runtime.get("gateway_state")
+    if gateway_state and gateway_state not in {"running", "starting"}:
+        issues.append({
+            "scope": "gateway",
+            "state": gateway_state,
+            "message": runtime.get("exit_reason"),
+        })
+
+    platforms = runtime.get("platforms") if isinstance(runtime.get("platforms"), dict) else {}
+    for name, info in platforms.items():
+        if not isinstance(info, dict):
+            continue
+        state = str(info.get("state") or "unknown").lower()
+        if state and state not in {"connected", "running", "ok"}:
+            issues.append({
+                "scope": "platform",
+                "platform": name,
+                "state": state,
+                "error_code": info.get("error_code"),
+                "message": info.get("error_message"),
+            })
+
+    targets = runtime.get("delivery_targets") if isinstance(runtime.get("delivery_targets"), dict) else {}
+    for key, info in targets.items():
+        if not isinstance(info, dict):
+            continue
+        if str(info.get("state") or "").lower() == "stale":
+            issues.append({
+                "scope": "delivery_target",
+                "target": key,
+                "state": "stale",
+                "error_code": info.get("error_code"),
+                "message": info.get("error_message"),
+            })
+
+    return {
+        "status": "degraded" if issues else "ok",
+        "issues": issues,
+    }
 
 
 def remove_pid_file() -> None:

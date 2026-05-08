@@ -1983,6 +1983,15 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     # implementations, so match on a small allow-list of stable
     # substrings rather than exception type.  Kept narrow to avoid
     # false positives on unrelated server errors.
+    exc_type = type(exc).__name__.lower()
+    if exc_type in {
+        "closedresourceerror",
+        "brokenresourceerror",
+        "endofstream",
+        "closedstreamerror",
+    }:
+        return True
+
     msg = str(exc).lower()
     if not msg:
         return False

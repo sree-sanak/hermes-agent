@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import signal
 import tempfile
@@ -784,6 +785,41 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+
+
+def _launch_post_turn_continuation_hook(payload: Dict[str, Any]) -> None:
+    """Best-effort, non-blocking post-turn continuation hook.
+
+    Sree's Hermes setup can enqueue obvious safe next steps after a gateway turn
+    ends. The hook is opt-out via ``HERMES_POST_TURN_CONTINUATION=0`` and only
+    runs if the local helper script exists. Failures are logged but never affect
+    the user-visible response path.
+    """
+    if str(os.getenv("HERMES_POST_TURN_CONTINUATION", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return
+    hook = _hermes_home / "scripts" / "hermes-post-turn-continuation.py"
+    if not hook.exists():
+        repo_hook = Path(__file__).resolve().parents[1] / "scripts" / "hermes-post-turn-continuation.py"
+        hook = repo_hook if repo_hook.exists() else hook
+    if not hook.exists():
+        return
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(hook)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if proc.stdin:
+            try:
+                proc.stdin.write(data)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+    except Exception as exc:
+        logger.debug("post-turn continuation hook failed to launch: %s", exc)
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -7532,6 +7568,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "codexusage":
+            return await self._handle_codex_usage_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -8338,6 +8377,10 @@ class GatewayRunner:
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
+            # Absolute cap prevents huge-window models from carrying 100k+ token
+            # Discord threads forever. Those are technically below context, but
+            # operationally slow and expensive. Config may override; 0 disables.
+            _hyg_absolute_max_tokens = 100_000
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 400
             _hyg_config_context_length = None
@@ -8382,6 +8425,12 @@ class GatewayRunner:
                                     _hyg_hard_msg_limit = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        try:
+                            _hyg_absolute_max_tokens = int(
+                                _comp_cfg.get("gateway_hygiene_max_tokens", _hyg_absolute_max_tokens)
+                            )
+                        except (TypeError, ValueError):
+                            pass
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -8469,17 +8518,19 @@ class GatewayRunner:
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
+                    or (_hyg_absolute_max_tokens > 0 and _approx_tokens >= _hyg_absolute_max_tokens)
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
 
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                        "(threshold: %s%% of %s = %s tokens)",
+                        "(threshold: min(%s%% of %s = %s tokens, absolute cap %s tokens))",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
+                        f"{_hyg_absolute_max_tokens:,}" if _hyg_absolute_max_tokens > 0 else "disabled",
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -11480,6 +11531,9 @@ class GatewayRunner:
             image_paths: list = []
             non_image_media: list = []
             for media_path, is_voice in media_files:
+                if not Path(media_path).is_file():
+                    logger.info("[%s] Skipping missing post-stream MEDIA attachment: %s", adapter.name, media_path)
+                    continue
                 ext = Path(media_path).suffix.lower()
                 if (ext in _IMAGE_EXTS
                         and not is_voice
@@ -13047,6 +13101,30 @@ class GatewayRunner:
         msg_count = len([m for m in history if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+
+    async def _handle_codex_usage_command(self, event: MessageEvent) -> str:
+        """Handle /codexusage command -- show OpenAI Codex usage on demand."""
+        try:
+            account_snapshot = await asyncio.to_thread(fetch_account_usage, "openai-codex")
+        except Exception:
+            account_snapshot = None
+
+        account_lines = render_account_usage_lines(account_snapshot, markdown=True)
+        if not account_lines:
+            return "Unable to fetch OpenAI Codex usage. Check `openai-codex` auth with `hermes auth list`."
+
+        session_window = next(
+            (
+                window for window in getattr(account_snapshot, "windows", ())
+                if str(getattr(window, "label", "")).lower() == "session"
+                and getattr(window, "used_percent", None) is not None
+            ),
+            None,
+        )
+        if session_window and float(session_window.used_percent) >= 75.0:
+            remaining = max(0, round(100 - float(session_window.used_percent)))
+            account_lines.append(f"⚠️ Codex session usage is above 75% ({remaining}% remaining).")
+        return "\n".join(account_lines)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
@@ -17278,6 +17356,23 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
+
+            # Best-effort local hook: after the assistant response is known,
+            # let Sree's continuation queue capture explicit safe next-step
+            # suggestions ("Next fix:", "Next step:", etc.). This is
+            # intentionally non-blocking and must never change the response.
+            try:
+                _launch_post_turn_continuation_hook({
+                    "platform": getattr(source.platform, "value", str(source.platform)),
+                    "source": source.to_dict() if hasattr(source, "to_dict") else {},
+                    "session_key": session_key,
+                    "session_id": effective_session_id,
+                    "user_message_preview": message[:1000] if isinstance(message, str) else "",
+                    "final_response": final_response,
+                    "model": _resolved_model,
+                })
+            except Exception:
+                pass
 
             return {
                 "final_response": final_response,

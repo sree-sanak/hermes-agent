@@ -8509,6 +8509,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "codexusage":
+            self._show_codex_usage()
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -10029,6 +10031,38 @@ class HermesCLI:
             # into stream-retry events, credential rotations, etc.
             # Console quietness is enforced by hermes_logging not
             # installing a console StreamHandler in non-verbose mode.
+
+    def _show_codex_usage(self):
+        """Show OpenAI Codex account/session usage on demand."""
+        account_snapshot = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+            try:
+                account_snapshot = _pool.submit(
+                    fetch_account_usage,
+                    "openai-codex",
+                ).result(timeout=15.0)
+            except (concurrent.futures.TimeoutError, Exception):
+                account_snapshot = None
+
+        account_lines = render_account_usage_lines(account_snapshot)
+        if not account_lines:
+            print("Unable to fetch OpenAI Codex usage. Check openai-codex auth with `hermes auth list`.")
+            return
+
+        for line in account_lines:
+            print(f"  {line}")
+
+        session_window = next(
+            (
+                window for window in getattr(account_snapshot, "windows", ())
+                if str(getattr(window, "label", "")).lower() == "session"
+                and getattr(window, "used_percent", None) is not None
+            ),
+            None,
+        )
+        if session_window and float(session_window.used_percent) >= 75.0:
+            remaining = max(0, round(100 - float(session_window.used_percent)))
+            print(f"  ⚠️ Codex session usage is above 75% ({remaining}% remaining).")
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
