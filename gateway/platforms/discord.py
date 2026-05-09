@@ -2753,9 +2753,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # leave that unset globally so message-sends keep working).
             # Wrap the typing POST in a short asyncio timeout so we escape
             # an unbounded retry loop on a sustained per-channel block.
-            # On bail, back off 60s -> exponential to 5 minutes so we let
-            # Discord drain the bucket instead of refilling it every 8s.
-            backoff = 60.0
+            # On bail, back off 10s -> exponential to 30s so the typing
+            # indicator recovers within seconds, not minutes.
+            backoff = 10.0
             try:
                 while True:
                     sleep_for = 8.0
@@ -2766,9 +2766,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         await asyncio.wait_for(
                             self._client.http.request(route),
-                            timeout=5.0,
+                            timeout=20.0,
                         )
-                        backoff = 60.0  # successful POST: reset backoff
+                        backoff = 10.0  # successful POST: reset backoff
                     except asyncio.CancelledError:
                         return
                     except (asyncio.TimeoutError, discord.errors.RateLimited) as e:
@@ -2777,7 +2777,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             chat_id, backoff, type(e).__name__,
                         )
                         sleep_for = backoff
-                        backoff = min(backoff * 2, 300.0)
+                        backoff = min(backoff * 2, 30.0)
                     except Exception as e:
                         logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
                     await asyncio.sleep(sleep_for)
