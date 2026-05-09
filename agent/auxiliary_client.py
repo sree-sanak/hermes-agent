@@ -769,20 +769,15 @@ class _CodexCompletionsAdapter:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
+            # sree/personal-customizations: skip is_interrupted() during auxiliary
+            # streams. New user messages set the interrupt flag on the agent thread
+            # and used to abort in-flight compression/vision/etc., causing runaway
+            # compression-retry loops on busy Discord channels (2026-05-08).
+            # The timeout below remains as the only stream-cancel signal.
             if deadline is not None and time.monotonic() >= deadline:
                 if not timed_out.is_set():
                     _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
-            try:
-                from tools.interrupt import is_interrupted
-                if is_interrupted():
-                    raise InterruptedError("Codex auxiliary Responses stream interrupted")
-            except InterruptedError:
-                raise
-            except Exception:
-                # Interrupt state is a best-effort UX hook; never make it a
-                # new failure mode for auxiliary calls.
-                pass
 
         try:
             # Collect output items and text deltas during streaming —
