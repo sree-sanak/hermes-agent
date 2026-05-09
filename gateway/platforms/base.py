@@ -2523,15 +2523,19 @@ class BasePlatformAdapter(ABC):
     async def _keep_typing(
         self,
         chat_id: str,
-        interval: float = 2.0,
+        interval: float = 4.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
     ) -> None:
         """
         Continuously send typing indicator until cancelled.
-        
-        Telegram/Discord typing status expires after ~5 seconds, so we refresh every 2
-        to recover quickly after progress messages interrupt it.
+
+        Telegram/Discord typing status expires after ~5 seconds, so we refresh
+        every 4s to stay under per-channel typing rate limits while still
+        keeping the bubble visible. Originally 2s upstream — too aggressive
+        for Discord, which 429s the typing endpoint when combined with the
+        manual send_typing calls in gateway/run.py and the 8s typing-loop
+        spawned inside the Discord adapter.
         
         Skips send_typing when the chat is in ``_typing_paused`` (e.g. while
         the agent is waiting for dangerous-command approval).  This is critical

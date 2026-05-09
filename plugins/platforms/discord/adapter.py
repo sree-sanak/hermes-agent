@@ -2784,16 +2784,42 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         async def _typing_loop() -> None:
+            # On transient failures (429 rate-limit, 5xx), do NOT exit the
+            # loop — just sleep and try again on the next tick. Exiting
+            # silently leaves a dead task in self._typing_tasks, and future
+            # send_typing() calls bail on the idempotency check, so the
+            # indicator stays dead until stop_typing() runs at end-of-message.
+            #
+            # discord.py retries 429s INDEFINITELY internally (only raises
+            # RateLimited when retry_after > max_ratelimit_timeout, and we
+            # leave that unset globally so message-sends keep working).
+            # Wrap the typing POST in a short asyncio timeout so we escape
+            # an unbounded retry loop on a sustained per-channel block.
+            # On bail, back off 60s -> exponential to 5 minutes so we let
+            # Discord drain the bucket instead of refilling it every 8s.
+            backoff = 60.0
             try:
                 while True:
+                    sleep_for = 8.0
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing",
                             channel_id=chat_id,
                         )
-                        await self._client.http.request(route)
+                        await asyncio.wait_for(
+                            self._client.http.request(route),
+                            timeout=5.0,
+                        )
+                        backoff = 60.0  # successful POST: reset backoff
                     except asyncio.CancelledError:
                         return
+                    except (asyncio.TimeoutError, discord.errors.RateLimited) as e:
+                        logger.debug(
+                            "Discord typing rate-limited on %s: backing off %.0fs (%s)",
+                            chat_id, backoff, type(e).__name__,
+                        )
+                        sleep_for = backoff
+                        backoff = min(backoff * 2, 300.0)
                     except Exception as e:
                         # Don't die on 429 — backoff and continue
                         retry_after = self._extract_discord_retry_after(e)
@@ -2814,6 +2840,9 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             finally:
+                # Clean up our entry on any exit so a future send_typing()
+                # can spin up a fresh loop. Idempotent vs. stop_typing() which
+                # also pops the entry.
                 self._typing_tasks.pop(chat_id, None)
 
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
