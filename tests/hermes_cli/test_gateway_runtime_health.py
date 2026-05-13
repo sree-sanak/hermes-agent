@@ -1,6 +1,25 @@
 from hermes_cli.gateway import _runtime_health_lines
 
 
+def test_runtime_health_lines_include_stale_delivery_targets(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "delivery_targets": {
+                "discord:123:456": {
+                    "state": "stale",
+                    "error_message": "404 Not Found (error code: 10003): Unknown Channel",
+                }
+            },
+        },
+    )
+
+    lines = _runtime_health_lines()
+
+    assert "⚠ delivery target stale: discord:123:456: 404 Not Found (error code: 10003): Unknown Channel" in lines
+
+
 def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypatch):
     monkeypatch.setattr(
         "gateway.status.read_runtime_status",
