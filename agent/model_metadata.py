@@ -913,6 +913,13 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         and ("available_tokens" in error_lower or "available tokens" in error_lower)
     )
     if not is_output_cap_error:
+        # MiniMax: "model[X] does not support max tokens > 196608 (2013)"
+        m = re.search(r"max[_ ]tokens?\s*>\s*(\d+)", error_lower)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
         return None
 
     # Extract the available_tokens figure.

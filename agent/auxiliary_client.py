@@ -2800,6 +2800,21 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    # ── MiniMax (OAuth via minimax.io) ─────────────────────────
+    if provider == "minimax-oauth":
+        try:
+            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+            creds = resolve_minimax_oauth_runtime_credentials()
+        except Exception as exc:
+            logger.warning("resolve_provider_client: minimax-oauth not available: %s", exc)
+            return None, None
+        return resolve_provider_client(
+            "minimax", model=model, async_mode=async_mode,
+            explicit_base_url=creds["base_url"],
+            explicit_api_key=creds["api_key"],
+            api_mode=api_mode, main_runtime=main_runtime, is_vision=is_vision,
+        )
+
     # ── OpenAI Codex (OAuth → Responses API) ─────────────────────────
     if provider == "openai-codex":
         if not model:

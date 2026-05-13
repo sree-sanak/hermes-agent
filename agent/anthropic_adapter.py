@@ -113,7 +113,11 @@ _ANTHROPIC_OUTPUT_LIMITS = {
     "claude-3-sonnet":     4_096,
     "claude-3-haiku":      4_096,
     # Third-party Anthropic-compatible providers
-    "minimax":            131_072,
+    # MiniMax-M2.7 nominally allows max_tokens up to 196_608, but its context
+    # window (~200K) is easily exceeded once large tool schemas + system
+    # prompts inflate input. Keep this conservative so output + input stays
+    # well under the window. See project memory: sree-dev-hermes-minimax-oauth.
+    "minimax":             16_384,
     # Qwen models via DashScope Anthropic-compatible endpoint
     # DashScope enforces max_tokens ∈ [1, 65536]
     "qwen3":               65_536,
