@@ -287,7 +287,28 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 exc,
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
-        except RuntimeError as exc:
+        except (RuntimeError, TypeError) as exc:
+            # openai 2.24.0's Responses .stream() accumulator calls
+            # parse_response() on the terminal response.completed event,
+            # which iterates ``response.output`` with no None guard
+            # (lib/_parsing/_responses.py). The chatgpt.com/backend-api/codex
+            # backend streams the answer via output_item.done /
+            # output_text.delta events but sends the terminal
+            # response.completed with output=null, so the SDK raises
+            # TypeError(NoneType object is not iterable) mid-stream. The
+            # byte stream is intact; create(stream=True) skips the SDK
+            # accumulator and recovers content via the same backfill path
+            # the other Codex-quirk handlers below already use.
+            if isinstance(exc, TypeError):
+                if "not iterable" not in str(exc):
+                    raise
+                logger.debug(
+                    "Responses .stream() accumulator hit None output "
+                    "(SDK parse_response); falling back to create(stream=True). %s err=%s",
+                    agent._client_log_context(),
+                    exc,
+                )
+                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
             # The OpenAI SDK's Responses streaming state machine raises
@@ -414,7 +435,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is not None:
                 # Backfill empty output from collected stream events
                 _out = getattr(terminal_response, "output", None)
-                if isinstance(_out, list) and not _out:
+                if not _out:
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)
                         logger.debug(

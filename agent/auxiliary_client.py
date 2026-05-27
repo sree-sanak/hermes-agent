@@ -791,26 +791,42 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    final = stream.get_final_response()
+            except TypeError as _te:
+                # openai SDK parse_response() iterates response.output with no
+                # None guard (lib/_parsing/_responses.py). chatgpt.com/backend-api/codex
+                # sends the terminal response.completed with output=null, crashing the
+                # .stream() accumulator mid-iteration. The streamed items were already
+                # collected above, so synthesize the final response from them instead
+                # of failing this auxiliary call (e.g. title generation).
+                if "not iterable" not in str(_te):
+                    raise
+                logger.debug(
+                    "Codex auxiliary: .stream() accumulator hit None output; "
+                    "synthesizing from %d collected item(s)/%d delta(s)",
+                    len(collected_output_items), len(collected_text_deltas),
+                )
+                final = SimpleNamespace(output=None, usage=None)
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if not _output:
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -840,7 +856,7 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
